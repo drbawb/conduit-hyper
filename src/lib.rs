@@ -7,17 +7,17 @@ extern crate unicase;
 #[macro_use]
 extern crate log;
 
-use futures::Future;
-use hyper::{HttpVersion, Method};
+use futures::{future, Future, Stream};
+use hyper::{Body, HttpVersion, Method};
 use hyper::header::{Headers as HyperHeaders, Host, ContentLength};
 use hyper::server::{Request as HyperRequest, Response as HyperResponse};
 use hyper::server::{Http, NewService, Service};
 use hyper::status::StatusCode;
 use std::collections::HashMap;
-use std::io::{self, Read, Cursor};
+use std::io::{self, Cursor, Read, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::str;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use unicase::UniCase;
 
 struct Request {
@@ -32,6 +32,9 @@ struct Request {
     content_length: Option<u64>,
     headers: Headers,
     extensions: conduit::Extensions,
+
+    request_stream: Option<Body>,
+    request_buffer: Cursor<Vec<u8>>,
 }
 
 impl Request {
@@ -70,26 +73,58 @@ impl Request {
             Method::Extension(_) => unimplemented!(),
         };
 
-        let host = request.headers().get::<Host>().unwrap().hostname();
-        let path = request.path();
+        let host = request.headers()
+            .get::<Host>()
+            .unwrap()
+            .hostname()
+            .to_string();
+
+        let path = request.path().to_string();
         let query_string = request.query().map(|query| query.to_owned());
         let remote_addr = *request.remote_addr();
         let content_length = request.headers().get::<ContentLength>().map(|h| h.0);
+
+        // let mut response_sink = Cursor::new(vec![]);
+        // if let Err(e) = sink_body(request.body(), &mut response_sink) {
+        //     error!("error reading response body: {:?}", e); 
+        // };
 
         Request {
             http_version: version,
             conduit_version: ver(0,1),
             method: method,
             scheme: scheme,
-            host_name: host.to_string(),
-            path: path.to_string(),
+            host_name: host,
+            path: path,
             query_string: query_string,
             remote_addr: remote_addr,
             content_length: content_length,
             headers: headers,
             extensions: extensions,
+
+            request_stream: Some(request.body()),
+            request_buffer: Cursor::new(vec![]),
         }
     }
+}
+
+fn sink_body(source: Body, sink: &mut Cursor<Vec<u8>>) -> io::Result<()> {
+    info!("sinking body ...");
+    source.for_each(|chunk| {
+        io::stdout().write_all(&chunk).map_err(From::from)
+    }).wait().unwrap();
+    info!("done sinking body");
+    // for chunk in source.wait() {
+    //     match chunk {
+    //         Ok(chunk) => { 
+    //             let mut chunk_reader = Cursor::new(chunk);
+    //             io::copy(&mut chunk_reader, sink)?; 
+    //         },
+    //         Err(msg) => return Err(io::Error::new(io::ErrorKind::BrokenPipe, msg)),
+    //     }
+    // }
+
+    Ok(())
 }
 
 fn ver(major: u64, minor: u64) -> semver::Version {
@@ -124,7 +159,14 @@ impl conduit::Request for Request {
     }
 
     fn body<'a>(&'a mut self) -> &'a mut Read { 
-        unimplemented!() 
+        if let Some(body) = self.request_stream.take() {
+            if let Err(e) = sink_body(body, &mut self.request_buffer) {
+                error!("error reading request body: {:?}", e);    
+            }
+        }
+
+        self.request_buffer.set_position(0);
+        &mut self.request_buffer
     }
 }
 
@@ -206,6 +248,7 @@ impl<H: conduit::Handler+'static> Service for ServiceAcceptor<H> {
     type Future   = Box<Future<Item = Self::Response, Error = Self::Error>>;
 
     fn call(&self, request: Self::Request) -> Self::Future {
+        info!("read headers");
         let mut headers = HashMap::new();
         for header in request.headers().iter() {
             headers.entry(header.name().to_owned())
@@ -213,6 +256,7 @@ impl<H: conduit::Handler+'static> Service for ServiceAcceptor<H> {
                 .push(header.value_string());
         }
 
+        info!("read request");
         let mut request = Request::new(
             request,
             self.scheme,
@@ -220,6 +264,7 @@ impl<H: conduit::Handler+'static> Service for ServiceAcceptor<H> {
             conduit::Extensions::new(),
         );
 
+        info!("calling into conduit");
         let mut resp = match self.handler.call(&mut request) {
             Ok(response) => response,
             Err(e) => {
@@ -232,25 +277,28 @@ impl<H: conduit::Handler+'static> Service for ServiceAcceptor<H> {
             }
         };
 
+        info!("preparing reponse headers");
         let mut outgoing_headers = HyperHeaders::with_capacity(resp.headers.len());
         for (key, value) in resp.headers {
             let value: Vec<_> = value.into_iter().map(|s| s.into_bytes()).collect();
             outgoing_headers.set_raw(key, value);
         }
 
+        info!("preparing response");
         // TODO: take advantage of tokio to stream resp here?
         let mut buf = vec![];
         if let Err(e) = respond(&mut buf, &mut resp.body) {
             error!("Error sending response: {:?}", e);    
         };
 
-
+        info!("generate response");
         let response = HyperResponse::new()
             .with_status(StatusCode::from_u16(resp.status.0 as u16))
             .with_headers(outgoing_headers)
             .with_body(buf);
 
-        futures::finished(response).boxed()
+        info!("future finish");
+        future::ok(response).boxed()
     }
 }
 
