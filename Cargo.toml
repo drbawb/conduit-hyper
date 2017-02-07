@@ -5,7 +5,11 @@ authors = ["Steven Fackler <sfackler@palantir.com>"]
 
 [dependencies]
 conduit = "0.8"
-hyper = { version = "0.10", default_features = false }
 log = "0.3"
 semver = "0.5"
 unicase = "1.4"
+
+[dependencies.hyper]
+git = "https://github.com/hyperium/hyper"
+branch = "master"
+default_features = false
