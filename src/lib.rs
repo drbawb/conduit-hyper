@@ -7,7 +7,7 @@ extern crate unicase;
 #[macro_use]
 extern crate log;
 
-use futures::{future, Future, Stream};
+use futures::{future, Async, Future, Poll, Stream};
 use hyper::{Body, HttpVersion, Method};
 use hyper::header::{Headers as HyperHeaders, Host, ContentLength};
 use hyper::server::{Request as HyperRequest, Response as HyperResponse};
@@ -19,6 +19,63 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::str;
 use std::sync::Arc;
 use unicase::UniCase;
+
+/// This is a request which has not yet finished reading the request body.
+/// Since conduit expects a synchronous `io::Read` body, we keep the request
+/// in this partial state and schedule it on the event loop until it is ready
+/// to be passed to the application.
+struct PartialRequest {
+    is_stolen: bool,
+    inner: Option<Request>,
+    request_buf:  Option<Vec<u8>>,
+    request_body: Body,
+}
+
+impl PartialRequest {
+    fn from(req: Request, body: Body) -> Self {
+        PartialRequest {
+            is_stolen: false,
+
+            inner: Some(req),
+            request_buf: Some(vec![]),
+            request_body: body,
+        }
+    }
+
+    fn append_chunk(&mut self, chunk: &[u8])  {
+        self.request_buf.as_mut().unwrap().extend_from_slice(chunk);
+    }
+}
+
+impl Future for PartialRequest {
+    type Item  = Request;
+    type Error = io::Error;
+
+    /// Polling this future means reading the next chunk from our request body
+    /// until we've buffered it entirely...
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        match self.request_body.poll() {
+            // handle a chunk from the request stream
+            Ok(Async::Ready(Some(body_chunk))) => {
+                self.append_chunk(&*body_chunk);
+                Ok(Async::NotReady)
+            },
+
+            Ok(Async::Ready(None)) => {
+                // TODO: it is unsafe to call #poll() again after we do this ...
+                assert_eq!(self.is_stolen, false); self.is_stolen = true;
+
+                let mut finished_request = self.inner.take().unwrap();
+                let mut finished_buffer = self.request_buf.take().unwrap();
+                finished_request.request_body = Some(Cursor::new(finished_buffer));
+                Ok(Async::Ready(finished_request))
+            },
+
+
+            _ => unimplemented!(),
+        }
+    }
+}
 
 struct Request {
     http_version: semver::Version,
@@ -33,8 +90,7 @@ struct Request {
     headers: Headers,
     extensions: conduit::Extensions,
 
-    request_stream: Option<Body>,
-    request_buffer: Cursor<Vec<u8>>,
+    request_body: Option<Cursor<Vec<u8>>>,
 }
 
 impl Request {
@@ -43,7 +99,7 @@ impl Request {
     ///
     /// This is done so that we are able to take the `hyper::Request` body,
     /// which will consume the incoming request.
-    fn new(request: HyperRequest, 
+    fn new(request: &HyperRequest, 
            scheme: conduit::Scheme, 
            headers: Headers, 
            extensions: conduit::Extensions) -> Request {
@@ -102,29 +158,9 @@ impl Request {
             headers: headers,
             extensions: extensions,
 
-            request_stream: Some(request.body()),
-            request_buffer: Cursor::new(vec![]),
+            request_body: None,
         }
     }
-}
-
-fn sink_body(source: Body, sink: &mut Cursor<Vec<u8>>) -> io::Result<()> {
-    info!("sinking body ...");
-    source.for_each(|chunk| {
-        io::stdout().write_all(&chunk).map_err(From::from)
-    }).wait().unwrap();
-    info!("done sinking body");
-    // for chunk in source.wait() {
-    //     match chunk {
-    //         Ok(chunk) => { 
-    //             let mut chunk_reader = Cursor::new(chunk);
-    //             io::copy(&mut chunk_reader, sink)?; 
-    //         },
-    //         Err(msg) => return Err(io::Error::new(io::ErrorKind::BrokenPipe, msg)),
-    //     }
-    // }
-
-    Ok(())
 }
 
 fn ver(major: u64, minor: u64) -> semver::Version {
@@ -159,14 +195,10 @@ impl conduit::Request for Request {
     }
 
     fn body<'a>(&'a mut self) -> &'a mut Read { 
-        if let Some(body) = self.request_stream.take() {
-            if let Err(e) = sink_body(body, &mut self.request_buffer) {
-                error!("error reading request body: {:?}", e);    
-            }
-        }
+        let mut buf = self.request_body.as_mut()
+            .expect("conduit read body before it was ready ?");
 
-        self.request_buffer.set_position(0);
-        &mut self.request_buffer
+        buf.set_position(0); buf
     }
 }
 
@@ -240,7 +272,6 @@ impl<H: conduit::Handler> NewService for ServiceAcceptor<H> {
         Ok(self.clone())
     }
 }
-
 impl<H: conduit::Handler+'static> Service for ServiceAcceptor<H> {
     type Request  = HyperRequest;
     type Response = HyperResponse;
@@ -256,49 +287,52 @@ impl<H: conduit::Handler+'static> Service for ServiceAcceptor<H> {
                 .push(header.value_string());
         }
 
-        info!("read request");
-        let mut request = Request::new(
-            request,
+        info!("read request (header)");
+        let mut app_request = Request::new(
+            &request,
             self.scheme,
             Headers(headers.into_iter().collect()),
             conduit::Extensions::new(),
         );
 
-        info!("calling into conduit");
-        let mut resp = match self.handler.call(&mut request) {
-            Ok(response) => response,
-            Err(e) => {
-                error!("Unhandled error: {}", e);
-                conduit::Response {
-                    status: (500, "Internal Server Error"),
-                    headers: HashMap::new(),
-                    body: Box::new(Cursor::new(e.to_string().into_bytes())),
+        PartialRequest::from(app_request, request.body()).and_then(|mut req| {
+            info!("calling into conduit");
+            let resp = match self.handler.call(&mut req) {
+                Ok(response) => response,
+                Err(e) => {
+                    error!("Unhandled error: {}", e);
+                    conduit::Response {
+                        status: (500, "Internal Server Error"),
+                        headers: HashMap::new(),
+                        body: Box::new(Cursor::new(e.to_string().into_bytes())),
+                    }
                 }
+            };
+
+            future::ok(resp)
+        }).and_then(|mut resp: conduit::Response| {
+            info!("preparing reponse headers");
+            let mut outgoing_headers = HyperHeaders::with_capacity(resp.headers.len());
+            for (key, value) in resp.headers {
+                let value: Vec<_> = value.into_iter().map(|s| s.into_bytes()).collect();
+                outgoing_headers.set_raw(key, value);
             }
-        };
 
-        info!("preparing reponse headers");
-        let mut outgoing_headers = HyperHeaders::with_capacity(resp.headers.len());
-        for (key, value) in resp.headers {
-            let value: Vec<_> = value.into_iter().map(|s| s.into_bytes()).collect();
-            outgoing_headers.set_raw(key, value);
-        }
+            info!("preparing response");
+            // TODO: take advantage of tokio to stream resp here?
+            let mut buf = vec![];
+            if let Err(e) = respond(&mut buf, &mut resp.body) {
+                error!("Error sending response: {:?}", e);    
+            };
 
-        info!("preparing response");
-        // TODO: take advantage of tokio to stream resp here?
-        let mut buf = vec![];
-        if let Err(e) = respond(&mut buf, &mut resp.body) {
-            error!("Error sending response: {:?}", e);    
-        };
+            info!("generate response");
+            let response = HyperResponse::new()
+                .with_status(StatusCode::from_u16(resp.status.0 as u16))
+                .with_headers(outgoing_headers)
+                .with_body(buf);
 
-        info!("generate response");
-        let response = HyperResponse::new()
-            .with_status(StatusCode::from_u16(resp.status.0 as u16))
-            .with_headers(outgoing_headers)
-            .with_body(buf);
-
-        info!("future finish");
-        future::ok(response).boxed()
+            future::ok(response)
+        }).boxed()
     }
 }
 
