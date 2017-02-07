@@ -162,6 +162,10 @@ impl<H: conduit::Handler+'static> Server<H> {
             scheme: conduit::Scheme::Http,
         })
     }
+
+    pub fn run(self) -> hyper::error::Result<()> {
+        self.server.run()
+    }
 }
 
 /// Accepts incoming requests and attaches them to the conduit handler
