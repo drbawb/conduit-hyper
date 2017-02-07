@@ -21,10 +21,75 @@ use std::sync::{Arc, RwLock};
 use unicase::UniCase;
 
 struct Request {
-    request: HyperRequest,
+    http_version: semver::Version,
+    conduit_version: semver::Version,
+    method: conduit::Method,
     scheme: conduit::Scheme,
+    host_name: String,
+    path: String,
+    query_string: Option<String>,
+    remote_addr: SocketAddr,
+    content_length: Option<u64>,
     headers: Headers,
     extensions: conduit::Extensions,
+}
+
+impl Request {
+    /// This creates a request from an incoming hyper request.
+    /// We immediately decompose it into the parts conduit cares about. 
+    ///
+    /// This is done so that we are able to take the `hyper::Request` body,
+    /// which will consume the incoming request.
+    fn new(request: HyperRequest, 
+           scheme: conduit::Scheme, 
+           headers: Headers, 
+           extensions: conduit::Extensions) -> Request {
+
+         let version = match *request.version() {
+            HttpVersion::Http09 => ver(0, 9),
+            HttpVersion::Http10 => ver(1, 0),
+            HttpVersion::Http11 => ver(1, 1),
+            HttpVersion::H2 => ver(2, 0),
+            HttpVersion::H2c => ver(2,0),
+
+            // NOTE: non-exhaustive patterns: `__DontMatchMe` not covered
+            _ => unimplemented!(),
+        };
+
+        let method = match *request.method() {
+            Method::Connect => conduit::Method::Connect,
+            Method::Delete => conduit::Method::Delete,
+            Method::Get => conduit::Method::Get,
+            Method::Head => conduit::Method::Head,
+            Method::Options => conduit::Method::Options,
+            Method::Patch => conduit::Method::Patch,
+            Method::Post => conduit::Method::Post,
+            Method::Put => conduit::Method::Put,
+            Method::Trace => conduit::Method::Trace,
+            // https://github.com/conduit-rust/conduit/pull/12
+            Method::Extension(_) => unimplemented!(),
+        };
+
+        let host = request.headers().get::<Host>().unwrap().hostname();
+        let path = request.path();
+        let query_string = request.query().map(|query| query.to_owned());
+        let remote_addr = *request.remote_addr();
+        let content_length = request.headers().get::<ContentLength>().map(|h| h.0);
+
+        Request {
+            http_version: version,
+            conduit_version: ver(0,1),
+            method: method,
+            scheme: scheme,
+            host_name: host.to_string(),
+            path: path.to_string(),
+            query_string: query_string,
+            remote_addr: remote_addr,
+            content_length: content_length,
+            headers: headers,
+            extensions: extensions,
+        }
+    }
 }
 
 fn ver(major: u64, minor: u64) -> semver::Version {
@@ -38,79 +103,28 @@ fn ver(major: u64, minor: u64) -> semver::Version {
 }
 
 impl conduit::Request for Request {
-    fn http_version(&self) -> semver::Version {
-        match *self.request.version() {
-            HttpVersion::Http09 => ver(0, 9),
-            HttpVersion::Http10 => ver(1, 0),
-            HttpVersion::Http11 => ver(1, 1),
-            HttpVersion::H2 => ver(2, 0),
-            HttpVersion::H2c => ver(2,0),
-
-            // NOTE: non-exhaustive patterns: `__DontMatchMe` not covered
-            _ => unimplemented!(),
-        }
-    }
-
-    fn conduit_version(&self) -> semver::Version {
-        ver(0, 1)
-    }
-
-    fn method(&self) -> conduit::Method {
-        match *self.request.method() {
-            Method::Connect => conduit::Method::Connect,
-            Method::Delete => conduit::Method::Delete,
-            Method::Get => conduit::Method::Get,
-            Method::Head => conduit::Method::Head,
-            Method::Options => conduit::Method::Options,
-            Method::Patch => conduit::Method::Patch,
-            Method::Post => conduit::Method::Post,
-            Method::Put => conduit::Method::Put,
-            Method::Trace => conduit::Method::Trace,
-            // https://github.com/conduit-rust/conduit/pull/12
-            Method::Extension(_) => unimplemented!(),
-        }
-    }
-
-    fn scheme(&self) -> conduit::Scheme {
-        self.scheme
-    }
+    fn http_version(&self) -> semver::Version { self.http_version.clone() }
+    fn conduit_version(&self) -> semver::Version { self.conduit_version.clone() }
+    fn method(&self) -> conduit::Method { self.method.clone() }
+    fn scheme(&self) -> conduit::Scheme { self.scheme }
+    fn headers(&self) -> &conduit::Headers { &self.headers }
+    fn content_length(&self) -> Option<u64> { self.content_length }
+    fn remote_addr(&self) -> SocketAddr { self.remote_addr }
+    fn virtual_root(&self) -> Option<&str> { None }
+    fn path(&self) -> &str { &self.path }
+    fn extensions(&self) -> &conduit::Extensions { &self.extensions }
+    fn mut_extensions(&mut self) -> &mut conduit::Extensions { &mut self.extensions }
 
     fn host<'c>(&'c self) -> conduit::Host<'c> {
-        conduit::Host::Name(&self.request.headers().get::<Host>().unwrap().hostname())
-    }
-
-    fn virtual_root(&self) -> Option<&str> {
-        None
-    }
-
-    fn path(&self) -> &str {
-        self.request.path()
+        conduit::Host::Name(&self.host_name)
     }
 
     fn query_string(&self) -> Option<&str> {
-        self.request.query()
+        self.query_string.as_ref().map(|inner| &**inner)
     }
 
-    fn remote_addr(&self) -> SocketAddr {
-        *self.request.remote_addr()
-    }
-
-    fn content_length(&self) -> Option<u64> {
-        self.request.headers().get::<ContentLength>().map(|h| h.0)
-    }
-
-    fn headers(&self) -> &conduit::Headers {
-        &self.headers
-    }
-
-    fn body<'a>(&'a mut self) -> &'a mut Read { unimplemented!() }
-
-    fn extensions(&self) -> &conduit::Extensions {
-        &self.extensions
-    }
-
-    fn mut_extensions(&mut self) -> &mut conduit::Extensions {
-        &mut self.extensions
+    fn body<'a>(&'a mut self) -> &'a mut Read { 
+        unimplemented!() 
     }
 }
 
@@ -135,12 +149,6 @@ impl conduit::Headers for Headers {
         self.0.iter().map(|&(ref k, ref vs)| (&**k, vs.iter().map(|v| &**v).collect())).collect()
     }
 }
-
-
-// Server::http("0.0.0.0:3000")
-//     .expect("could not start http server")
-//     .handle(endpoint)
-//     .expect("could not attach handler");
 
 pub struct Server<H> {
     server: hyper::Server<ServiceAcceptor<H>>,
@@ -205,12 +213,12 @@ impl<H: conduit::Handler+'static> Service for ServiceAcceptor<H> {
                 .push(header.value_string());
         }
 
-        let mut request = Request {
-            request: request,
-            scheme: self.scheme,
-            headers: Headers(headers.into_iter().collect()),
-            extensions: conduit::Extensions::new(),
-        };
+        let mut request = Request::new(
+            request,
+            self.scheme,
+            Headers(headers.into_iter().collect()),
+            conduit::Extensions::new(),
+        );
 
         let mut resp = match self.handler.call(&mut request) {
             Ok(response) => response,
