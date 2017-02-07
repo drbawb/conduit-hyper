@@ -1,5 +1,6 @@
 extern crate conduit;
 extern crate futures;
+extern crate futures_cpupool;
 extern crate hyper;
 extern crate semver;
 extern crate unicase;
@@ -8,6 +9,7 @@ extern crate unicase;
 extern crate log;
 
 use futures::{future, Async, Future, Poll, Stream};
+use futures_cpupool::CpuPool;
 use hyper::{Body, HttpVersion, Method};
 use hyper::header::{Headers as HyperHeaders, Host, ContentLength};
 use hyper::server::{Request as HyperRequest, Response as HyperResponse};
@@ -24,15 +26,15 @@ use unicase::UniCase;
 /// Since conduit expects a synchronous `io::Read` body, we keep the request
 /// in this partial state and schedule it on the event loop until it is ready
 /// to be passed to the application.
-struct PartialRequest {
+struct RequestBuffer {
     is_stolen: bool,
     request_buf:  Option<Vec<u8>>,
     request_body: Body,
 }
 
-impl PartialRequest {
+impl RequestBuffer {
     fn from(body: Body) -> Self {
-        PartialRequest {
+        RequestBuffer {
             is_stolen: false,
             request_buf: Some(vec![]),
             request_body: body,
@@ -44,7 +46,7 @@ impl PartialRequest {
     }
 }
 
-impl Future for PartialRequest {
+impl Future for RequestBuffer {
     type Item  = Cursor<Vec<u8>>;
     type Error = io::Error;
 
@@ -74,7 +76,10 @@ impl Future for PartialRequest {
     }
 }
 
-struct Request {
+/// This represents info that conduit will need from the incoming
+/// HTTP request ... this is split out from the information which would
+/// block the event-loop if we were to attempt to gather it immediately.
+struct RequestInfo {
     http_version: semver::Version,
     conduit_version: semver::Version,
     method: conduit::Method,
@@ -85,20 +90,12 @@ struct Request {
     remote_addr: SocketAddr,
     content_length: Option<u64>,
     headers: Headers,
-    extensions: conduit::Extensions,
-
-    request_body: Option<Cursor<Vec<u8>>>,
 }
 
-impl Request {
-    /// This creates a request from an incoming hyper request.
-    /// We immediately decompose it into the parts conduit cares about. 
-    ///
-    /// This is done so that we are able to take the `hyper::Request` body,
-    /// which will consume the incoming request.
+impl RequestInfo {
     fn new(request: &HyperRequest, 
            scheme: conduit::Scheme, 
-           headers: Headers) -> Request {
+           headers: Headers) -> RequestInfo {
 
          let version = match *request.version() {
             HttpVersion::Http09 => ver(0, 9),
@@ -136,7 +133,7 @@ impl Request {
         let remote_addr = *request.remote_addr();
         let content_length = request.headers().get::<ContentLength>().map(|h| h.0);
 
-        Request {
+        RequestInfo {
             http_version: version,
             conduit_version: ver(0,1),
             method: method,
@@ -147,9 +144,6 @@ impl Request {
             remote_addr: remote_addr,
             content_length: content_length,
             headers: headers,
-            extensions: conduit::Extensions::new(),
-
-            request_body: None,
         }
     }
 }
@@ -164,33 +158,48 @@ fn ver(major: u64, minor: u64) -> semver::Version {
     }
 }
 
-impl conduit::Request for Request {
-    fn http_version(&self) -> semver::Version { self.http_version.clone() }
-    fn conduit_version(&self) -> semver::Version { self.conduit_version.clone() }
-    fn method(&self) -> conduit::Method { self.method.clone() }
-    fn scheme(&self) -> conduit::Scheme { self.scheme }
-    fn headers(&self) -> &conduit::Headers { &self.headers }
-    fn content_length(&self) -> Option<u64> { self.content_length }
-    fn remote_addr(&self) -> SocketAddr { self.remote_addr }
+/// This represents a completely loaded request, which is ready
+/// to be scheduled to a CPU core and handled by the conduit application.
+struct CompletedRequest {
+    req_body: Cursor<Vec<u8>>,
+    req_info: RequestInfo,
+    extensions: conduit::Extensions,
+}
+
+impl CompletedRequest {
+    fn from(req_info: RequestInfo, req_body: Cursor<Vec<u8>>) -> Self {
+        CompletedRequest {
+            req_body: req_body,
+            req_info: req_info,
+            extensions: conduit::Extensions::new(),
+        }
+    }
+}
+
+impl conduit::Request for CompletedRequest {
+    fn http_version(&self) -> semver::Version { self.req_info.http_version.clone() }
+    fn conduit_version(&self) -> semver::Version { self.req_info.conduit_version.clone() }
+    fn method(&self) -> conduit::Method { self.req_info.method.clone() }
+    fn scheme(&self) -> conduit::Scheme { self.req_info.scheme }
+    fn headers(&self) -> &conduit::Headers { &self.req_info.headers }
+    fn content_length(&self) -> Option<u64> { self.req_info.content_length }
+    fn remote_addr(&self) -> SocketAddr { self.req_info.remote_addr }
     fn virtual_root(&self) -> Option<&str> { None }
-    fn path(&self) -> &str { &self.path }
+    fn path(&self) -> &str { &self.req_info.path }
     fn extensions(&self) -> &conduit::Extensions { &self.extensions }
     fn mut_extensions(&mut self) -> &mut conduit::Extensions { &mut self.extensions }
 
 
     fn host<'c>(&'c self) -> conduit::Host<'c> {
-        conduit::Host::Name(&self.host_name)
+        conduit::Host::Name(&self.req_info.host_name)
     }
 
     fn query_string(&self) -> Option<&str> {
-        self.query_string.as_ref().map(|inner| &**inner)
+        self.req_info.query_string.as_ref().map(|inner| &**inner)
     }
 
     fn body<'a>(&'a mut self) -> &'a mut Read { 
-        let mut buf = self.request_body.as_mut()
-            .expect("conduit read body before it was ready ?");
-
-        buf.set_position(0); buf
+        self.req_body.set_position(0); &mut self.req_body
     }
 }
 
@@ -223,6 +232,7 @@ pub struct Server<H> {
 impl<H: conduit::Handler+'static> Server<H> {
     pub fn http(addr: SocketAddr, handler: H) -> hyper::error::Result<Server<H>> {
         let acceptor = ServiceAcceptor {
+            cpu_pool: CpuPool::new_num_cpus(),
             handler: Arc::new(handler),
             scheme: conduit::Scheme::Http,
         };
@@ -239,6 +249,7 @@ impl<H: conduit::Handler+'static> Server<H> {
 
 /// Accepts incoming requests and attaches them to the conduit handler
 struct ServiceAcceptor<H> { 
+    cpu_pool: CpuPool,
     handler: Arc<H>,
     scheme: conduit::Scheme,
 }
@@ -248,6 +259,7 @@ struct ServiceAcceptor<H> {
 impl<H> Clone for ServiceAcceptor<H> {
     fn clone(&self) -> Self {
         ServiceAcceptor {
+            cpu_pool: self.cpu_pool.clone(),
             handler: self.handler.clone(),
             scheme:  self.scheme,
         }
@@ -278,45 +290,48 @@ impl<H: conduit::Handler+'static> Service for ServiceAcceptor<H> {
                 .push(header.value_string());
         }
 
-        let mut app_request = Request::new(
+        let app_request = RequestInfo::new(
             &request,
             self.scheme,
             Headers(headers.into_iter().collect()),
         );
 
+        let thread_worker = self.cpu_pool.clone();
         let thread_handler = self.handler.clone();
-        Box::new(PartialRequest::from(request.body()).and_then(move |req_body| {
-            app_request.request_body = Some(req_body);
-            let mut resp = match thread_handler.call(&mut app_request) {
-                Ok(response) => response,
-                Err(e) => {
-                    error!("Unhandled error: {}", e);
-                    conduit::Response {
-                        status: (500, "Internal Server Error"),
-                        headers: HashMap::new(),
-                        body: Box::new(Cursor::new(e.to_string().into_bytes())),
+        Box::new(RequestBuffer::from(request.body()).and_then(move |req_body| {
+            thread_worker.spawn_fn(move || {
+                let mut app_request = CompletedRequest::from(app_request, req_body);
+                let mut resp = match thread_handler.call(&mut app_request) {
+                    Ok(response) => response,
+                    Err(e) => {
+                        error!("Unhandled error: {}", e);
+                        conduit::Response {
+                            status: (500, "Internal Server Error"),
+                            headers: HashMap::new(),
+                            body: Box::new(Cursor::new(e.to_string().into_bytes())),
+                        }
                     }
-                }
-            };
+                };
 
-            let mut outgoing_headers = HyperHeaders::with_capacity(resp.headers.len());
-            for (key, value) in resp.headers {
-                let value: Vec<_> = value.into_iter().map(|s| s.into_bytes()).collect();
-                outgoing_headers.set_raw(key, value);
-            }
- 
-            // TODO: take advantage of tokio to stream resp here?
-            let mut buf = vec![];
-            if let Err(e) = respond(&mut buf, &mut resp.body) {
-                error!("Error sending response: {:?}", e);    
-            };
- 
-            let response = HyperResponse::new()
-                .with_status(StatusCode::from_u16(resp.status.0 as u16))
-                .with_headers(outgoing_headers)
-                .with_body(buf);
- 
-            future::ok(response).boxed()
+                let mut outgoing_headers = HyperHeaders::with_capacity(resp.headers.len());
+                for (key, value) in resp.headers {
+                    let value: Vec<_> = value.into_iter().map(|s| s.into_bytes()).collect();
+                    outgoing_headers.set_raw(key, value);
+                }
+     
+                // TODO: take advantage of tokio to stream resp here?
+                let mut buf = vec![];
+                if let Err(e) = respond(&mut buf, &mut resp.body) {
+                    error!("Error sending response: {:?}", e);    
+                };
+     
+                let response = HyperResponse::new()
+                    .with_status(StatusCode::from_u16(resp.status.0 as u16))
+                    .with_headers(outgoing_headers)
+                    .with_body(buf);
+     
+                future::ok(response).boxed()
+            }).boxed()
         }).map_err(|io_err| {
             hyper::Error::Io(io_err) 
         }))
