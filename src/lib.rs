@@ -1,4 +1,5 @@
 extern crate conduit;
+extern crate futures;
 extern crate hyper;
 extern crate semver;
 extern crate unicase;
@@ -14,10 +15,13 @@ extern crate log;
 // use hyper::status::StatusCode;
 // use std::collections::HashMap;
 // use std::str;
+use std::sync::{Arc, RwLock};
 
+use futures::{Future, Poll};
 use hyper::{HttpVersion, Method};
 use hyper::header::{Headers as HyperHeaders, Host, ContentLength};
-use hyper::server::{Request as HyperRequest, Response};
+use hyper::server::{Request as HyperRequest, Response as HyperResponse};
+use hyper::server::{Http, NewService, Service};
 use std::io::{self, Read, Cursor};
 use std::net::{SocketAddr, ToSocketAddrs};
 use unicase::UniCase;
@@ -138,6 +142,76 @@ impl conduit::Headers for Headers {
     }
 }
 
+
+// Server::http("0.0.0.0:3000")
+//     .expect("could not start http server")
+//     .handle(endpoint)
+//     .expect("could not attach handler");
+
+pub struct Server<H> {
+    server: hyper::Server<ServiceAcceptor<H>>,
+    scheme: conduit::Scheme,
+}
+
+impl<H: conduit::Handler+'static> Server<H> {
+    pub fn http(addr: SocketAddr, handler: H) -> hyper::error::Result<Server<H>> {
+        let acceptor = ServiceAcceptor::new(handler);
+
+        Ok(Server {
+            server: Http::new().bind(&addr, acceptor)?,
+            scheme: conduit::Scheme::Http,
+        })
+    }
+}
+
+/// Accepts incoming requests and attaches them to the conduit handler
+struct ServiceAcceptor<H> { handler: Arc<H> }
+
+// NOTE: puts handler behind an arc so that service futures can access it
+impl<H: conduit::Handler> ServiceAcceptor<H> {
+    /// Create a new server which will use this handler to transform
+    /// requests
+    pub fn new(handler: H) -> ServiceAcceptor<H> {
+        ServiceAcceptor {
+            handler: Arc::new(handler),
+        }
+    }
+}
+
+impl<H: conduit::Handler> NewService for ServiceAcceptor<H> {
+    type Request  = HyperRequest;
+    type Response = HyperResponse;
+    type Error    = hyper::Error; // TODO: better error type?
+    type Instance = ServiceTerminator<H>;
+
+    fn new_service(&self) -> Result<Self::Instance, io::Error> {
+        let terminator = ServiceTerminator::new(self.handler.clone());
+        Ok(terminator)
+    }
+}
+
+struct ServiceTerminator<H: 'static> { handler: Arc<H> }
+
+impl<H: conduit::Handler+'static> ServiceTerminator<H> {
+    pub fn new(handler: Arc<H>) -> ServiceTerminator<H> {
+        ServiceTerminator { handler: handler }
+    }
+}
+
+impl<H: conduit::Handler+'static> Service for ServiceTerminator<H> {
+    type Request  = HyperRequest;
+    type Response = HyperResponse;
+    type Error    = hyper::Error; // TODO: better error type?
+    type Future   = Box<Future<Item = Self::Response, Error = Self::Error>>;
+
+    fn call(&self, req: Self::Request) -> Self::Future {
+        let mut resp = Self::Response::new()
+            .with_body(String::from("hello conduit!").into_bytes());
+
+        futures::finished(resp).boxed()
+    }
+}
+
 // pub struct Server<L> {
 //     server: hyper::Server<L>,
 //     scheme: conduit::Scheme,
@@ -148,7 +222,7 @@ impl conduit::Headers for Headers {
 //         where T: ToSocketAddrs
 //     {
 //         Ok(Server {
-//             server: hyper::Server::http(addr)?,
+//             server: hyper::Http::bind(addr)?,
 //             scheme: conduit::Scheme::Http,
 //         })
 //     }
