@@ -271,7 +271,6 @@ impl<H: conduit::Handler+'static> Service for ServiceAcceptor<H> {
     type Future   = Box<Future<Item = Self::Response, Error = Self::Error>>;
 
     fn call(&self, request: Self::Request) -> Self::Future {
-        info!("read headers");
         let mut headers = HashMap::new();
         for header in request.headers().iter() {
             headers.entry(header.name().to_owned())
@@ -279,7 +278,6 @@ impl<H: conduit::Handler+'static> Service for ServiceAcceptor<H> {
                 .push(header.value_string());
         }
 
-        info!("read request (header)");
         let mut app_request = Request::new(
             &request,
             self.scheme,
@@ -288,7 +286,6 @@ impl<H: conduit::Handler+'static> Service for ServiceAcceptor<H> {
 
         let thread_handler = self.handler.clone();
         Box::new(PartialRequest::from(request.body()).and_then(move |req_body| {
-            info!("calling into conduit");
             app_request.request_body = Some(req_body);
             let mut resp = match thread_handler.call(&mut app_request) {
                 Ok(response) => response,
@@ -302,21 +299,18 @@ impl<H: conduit::Handler+'static> Service for ServiceAcceptor<H> {
                 }
             };
 
-            info!("preparing reponse headers");
             let mut outgoing_headers = HyperHeaders::with_capacity(resp.headers.len());
             for (key, value) in resp.headers {
                 let value: Vec<_> = value.into_iter().map(|s| s.into_bytes()).collect();
                 outgoing_headers.set_raw(key, value);
             }
  
-            info!("preparing response");
             // TODO: take advantage of tokio to stream resp here?
             let mut buf = vec![];
             if let Err(e) = respond(&mut buf, &mut resp.body) {
                 error!("Error sending response: {:?}", e);    
             };
  
-            info!("generate response");
             let response = HyperResponse::new()
                 .with_status(StatusCode::from_u16(resp.status.0 as u16))
                 .with_headers(outgoing_headers)
