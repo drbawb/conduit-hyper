@@ -14,7 +14,7 @@ use hyper::server::{Request as HyperRequest, Response as HyperResponse};
 use hyper::server::{Http, NewService, Service};
 use hyper::status::StatusCode;
 use std::collections::HashMap;
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Cursor, Read};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::str;
 use std::sync::Arc;
@@ -26,17 +26,14 @@ use unicase::UniCase;
 /// to be passed to the application.
 struct PartialRequest {
     is_stolen: bool,
-    inner: Option<Request>,
     request_buf:  Option<Vec<u8>>,
     request_body: Body,
 }
 
 impl PartialRequest {
-    fn from(req: Request, body: Body) -> Self {
+    fn from(body: Body) -> Self {
         PartialRequest {
             is_stolen: false,
-
-            inner: Some(req),
             request_buf: Some(vec![]),
             request_body: body,
         }
@@ -48,7 +45,7 @@ impl PartialRequest {
 }
 
 impl Future for PartialRequest {
-    type Item  = Request;
+    type Item  = Cursor<Vec<u8>>;
     type Error = io::Error;
 
     /// Polling this future means reading the next chunk from our request body
@@ -65,11 +62,11 @@ impl Future for PartialRequest {
                 // TODO: it is unsafe to call #poll() again after we do this ...
                 assert_eq!(self.is_stolen, false); self.is_stolen = true;
 
-                let mut finished_request = self.inner.take().unwrap();
-                let mut finished_buffer = self.request_buf.take().unwrap();
-                finished_request.request_body = Some(Cursor::new(finished_buffer));
-                Ok(Async::Ready(finished_request))
+                let finished_buffer = self.request_buf.take().unwrap();
+                Ok(Async::Ready(Cursor::new(finished_buffer)))
             },
+
+            Ok(Async::NotReady) => Ok(Async::NotReady),
 
 
             _ => unimplemented!(),
@@ -101,8 +98,7 @@ impl Request {
     /// which will consume the incoming request.
     fn new(request: &HyperRequest, 
            scheme: conduit::Scheme, 
-           headers: Headers, 
-           extensions: conduit::Extensions) -> Request {
+           headers: Headers) -> Request {
 
          let version = match *request.version() {
             HttpVersion::Http09 => ver(0, 9),
@@ -140,11 +136,6 @@ impl Request {
         let remote_addr = *request.remote_addr();
         let content_length = request.headers().get::<ContentLength>().map(|h| h.0);
 
-        // let mut response_sink = Cursor::new(vec![]);
-        // if let Err(e) = sink_body(request.body(), &mut response_sink) {
-        //     error!("error reading response body: {:?}", e); 
-        // };
-
         Request {
             http_version: version,
             conduit_version: ver(0,1),
@@ -156,7 +147,7 @@ impl Request {
             remote_addr: remote_addr,
             content_length: content_length,
             headers: headers,
-            extensions: extensions,
+            extensions: conduit::Extensions::new(),
 
             request_body: None,
         }
@@ -185,6 +176,7 @@ impl conduit::Request for Request {
     fn path(&self) -> &str { &self.path }
     fn extensions(&self) -> &conduit::Extensions { &self.extensions }
     fn mut_extensions(&mut self) -> &mut conduit::Extensions { &mut self.extensions }
+
 
     fn host<'c>(&'c self) -> conduit::Host<'c> {
         conduit::Host::Name(&self.host_name)
@@ -292,12 +284,13 @@ impl<H: conduit::Handler+'static> Service for ServiceAcceptor<H> {
             &request,
             self.scheme,
             Headers(headers.into_iter().collect()),
-            conduit::Extensions::new(),
         );
 
-        PartialRequest::from(app_request, request.body()).and_then(|mut req| {
+        let thread_handler = self.handler.clone();
+        Box::new(PartialRequest::from(request.body()).and_then(move |req_body| {
             info!("calling into conduit");
-            let resp = match self.handler.call(&mut req) {
+            app_request.request_body = Some(req_body);
+            let mut resp = match thread_handler.call(&mut app_request) {
                 Ok(response) => response,
                 Err(e) => {
                     error!("Unhandled error: {}", e);
@@ -309,30 +302,30 @@ impl<H: conduit::Handler+'static> Service for ServiceAcceptor<H> {
                 }
             };
 
-            future::ok(resp)
-        }).and_then(|mut resp: conduit::Response| {
             info!("preparing reponse headers");
             let mut outgoing_headers = HyperHeaders::with_capacity(resp.headers.len());
             for (key, value) in resp.headers {
                 let value: Vec<_> = value.into_iter().map(|s| s.into_bytes()).collect();
                 outgoing_headers.set_raw(key, value);
             }
-
+ 
             info!("preparing response");
             // TODO: take advantage of tokio to stream resp here?
             let mut buf = vec![];
             if let Err(e) = respond(&mut buf, &mut resp.body) {
                 error!("Error sending response: {:?}", e);    
             };
-
+ 
             info!("generate response");
             let response = HyperResponse::new()
                 .with_status(StatusCode::from_u16(resp.status.0 as u16))
                 .with_headers(outgoing_headers)
                 .with_body(buf);
-
-            future::ok(response)
-        }).boxed()
+ 
+            future::ok(response).boxed()
+        }).map_err(|io_err| {
+            hyper::Error::Io(io_err) 
+        }))
     }
 }
 
