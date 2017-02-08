@@ -22,10 +22,10 @@ use std::str;
 use std::sync::Arc;
 use unicase::UniCase;
 
-/// This is a request which has not yet finished reading the request body.
-/// Since conduit expects a synchronous `io::Read` body, we keep the request
-/// in this partial state and schedule it on the event loop until it is ready
-/// to be passed to the application.
+/// This is a request body which has not yet been read in it's entirety.
+///
+/// Since conduit expects an `io::Read` impl from the stdlib's synchronous IO
+/// we buffer the response body until it is ready to be read in its entirety.
 struct RequestBuffer {
     is_stolen: bool,
     request_buf:  Option<Vec<u8>>,
@@ -76,9 +76,13 @@ impl Future for RequestBuffer {
     }
 }
 
-/// This represents info that conduit will need from the incoming
-/// HTTP request ... this is split out from the information which would
-/// block the event-loop if we were to attempt to gather it immediately.
+/// This represents info which conduit will need from the incoming
+/// HTTP request. This is split out from the extension storage so that it
+/// can be safely moved between threads while we await the response body.
+///
+/// This data must be parsed from a request before the body can be read,
+/// since taking the `Body` stream from a `hyper::Request` will consume
+/// said request.
 struct RequestInfo {
     http_version: semver::Version,
     conduit_version: semver::Version,
@@ -145,16 +149,6 @@ impl RequestInfo {
             content_length: content_length,
             headers: headers,
         }
-    }
-}
-
-fn ver(major: u64, minor: u64) -> semver::Version {
-    semver::Version {
-        major: major,
-        minor: minor,
-        patch: 0,
-        pre: vec!(),
-        build: vec!()
     }
 }
 
@@ -247,7 +241,12 @@ impl<H: conduit::Handler+'static> Server<H> {
     }
 }
 
-/// Accepts incoming requests and attaches them to the conduit handler
+/// This structure accepts incoming HTTP requests and maintains enough
+/// state to cooperatively schedule them on the event loop.
+///
+/// It is implemented as a `conduit::Handler` which runs arbitrary application
+/// code, along with a CPU pool to prevent said application from blocking the
+/// evented I/O.
 struct ServiceAcceptor<H> { 
     cpu_pool: CpuPool,
     handler: Arc<H>,
@@ -272,16 +271,34 @@ impl<H: conduit::Handler> NewService for ServiceAcceptor<H> {
     type Error    = hyper::Error; // TODO: better error type?
     type Instance = ServiceAcceptor<H>;
 
+    /// This service furnishes requests by simply cloning itself.
     fn new_service(&self) -> Result<Self::Instance, io::Error> {
         Ok(self.clone())
     }
 }
+
 impl<H: conduit::Handler+'static> Service for ServiceAcceptor<H> {
     type Request  = HyperRequest;
     type Response = HyperResponse;
     type Error    = hyper::Error; // TODO: better error type?
     type Future   = Box<Future<Item = Self::Response, Error = Self::Error>>;
 
+    /// Incoming requests are handled in a few distinct phases:
+    /// 
+    /// - First we parse the incoming request information and parse
+    ///   it into a format which `conduit` is expecting. We set this
+    ///   request info aside.
+    ///   
+    /// - Next we buffer the response body until it has either been
+    ///   read in its entirety, or the remote peer hung up.
+    ///
+    /// - Lastly we combine the buffer & request info into a single
+    ///   `conduit::Request` trait object which is passed to the application
+    ///   layer to ultimately generate a response. (To prevent stalling the
+    ///   event loop we schedule this application code to run on a thread pool.)
+    /// 
+    /// - Finally the response is emitted and `hyper` will take care of the rest.
+    ///
     fn call(&self, request: Self::Request) -> Self::Future {
         let mut headers = HashMap::new();
         for header in request.headers().iter() {
@@ -296,6 +313,10 @@ impl<H: conduit::Handler+'static> Service for ServiceAcceptor<H> {
             Headers(headers.into_iter().collect()),
         );
 
+        // NOTE: we explicitly clone these out here, as passing `self` into the
+        //       closures below tends to produce an error that the future does
+        //       not outlive the 'static lifetime.
+        //
         let thread_worker = self.cpu_pool.clone();
         let thread_handler = self.handler.clone();
         Box::new(RequestBuffer::from(request.body()).and_then(move |req_body| {
@@ -338,6 +359,18 @@ impl<H: conduit::Handler+'static> Service for ServiceAcceptor<H> {
     }
 }
 
+/// Helper to create a version identifier
+fn ver(major: u64, minor: u64) -> semver::Version {
+    semver::Version {
+        major: major,
+        minor: minor,
+        patch: 0,
+        pre: vec!(),
+        build: vec!()
+    }
+}
+
+/// Helper to copy the `conduit` response body into a byte buffer
 fn respond(response: &mut Vec<u8>, body: &mut Box<conduit::WriteBody + Send>) -> io::Result<()> {
         body.write_body(response)?;
         Ok(())
